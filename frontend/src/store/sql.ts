@@ -31,6 +31,47 @@ export interface ParsedQuery {
   estimatedCost: number
 }
 
+export interface AnalysisReport {
+  id: string
+  name: string
+  createdAt: number
+  sql: string
+  type: ParsedQuery['type']
+  complexity: number
+  complexityLabel: string
+  tables: string[]
+  suggestions: string[]
+  includePlan: boolean
+  plan: QueryPlan | null
+}
+
+export interface ExportFailure {
+  name: string
+  stage: string
+  message: string
+  at: number
+}
+
+export const EXPORT_STAGES = ['生成快照', '写入存储', '更新索引'] as const
+
+const REPORTS_KEY = 'sql_analysis_reports'
+const EXPORT_JOURNAL_KEY = 'sql_analysis_export_journal'
+
+interface ExportJournal {
+  report: AnalysisReport
+  stage: string
+  at: number
+}
+
+function storageGet<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? (JSON.parse(raw) as T) : null
+  } catch {
+    return null
+  }
+}
+
 const SCHEMA: SQLTable[] = [
   { name: 'users', rowCount: 50000, columns: [
     { name: 'id', type: 'INT', pk: true }, { name: 'username', type: 'VARCHAR(50)' },
@@ -147,5 +188,98 @@ export const useSQLStore = defineStore('sql', () => {
     return { label: '非常复杂', color: 'text-red-400' }
   })
 
-  return { sql, parsed, plan, activeSchema, complexityLabel, analyze }
+  // ---- 分析报告导出与留存 ----
+  const reports = ref<AnalysisReport[]>(storageGet<AnalysisReport[]>(REPORTS_KEY) || [])
+  const exportFailure = ref<ExportFailure | null>(null)
+
+  function writeJournal(report: AnalysisReport, stage: string) {
+    try { localStorage.setItem(EXPORT_JOURNAL_KEY, JSON.stringify({ report, stage, at: Date.now() } satisfies ExportJournal)) } catch { /* 日志写入失败不阻断流程 */ }
+  }
+
+  function clearJournal() {
+    try { localStorage.removeItem(EXPORT_JOURNAL_KEY) } catch { /* noop */ }
+  }
+
+  // 启动时检查上次导出是否被中断（日志未清除说明写入未完成）
+  const pendingJournal = storageGet<ExportJournal>(EXPORT_JOURNAL_KEY)
+  if (pendingJournal) {
+    if (reports.value.some(r => r.id === pendingJournal.report.id)) {
+      clearJournal() // 数据实际已写入，仅日志未清理
+    } else {
+      exportFailure.value = { name: pendingJournal.report.name, stage: pendingJournal.stage, message: '上次导出在该阶段被中断，可重新发起', at: pendingJournal.at }
+    }
+  }
+
+  function runExport(report: AnalysisReport): boolean {
+    let stage: string = EXPORT_STAGES[0]
+    try {
+      writeJournal(report, stage)
+      const snapshot = JSON.parse(JSON.stringify(report)) as AnalysisReport
+
+      stage = EXPORT_STAGES[1]
+      writeJournal(report, stage)
+      const next = [snapshot, ...reports.value.filter(r => r.id !== snapshot.id)]
+      localStorage.setItem(REPORTS_KEY, JSON.stringify(next))
+
+      stage = EXPORT_STAGES[2]
+      writeJournal(report, stage)
+      reports.value = next
+
+      clearJournal()
+      exportFailure.value = null
+      return true
+    } catch (e) {
+      exportFailure.value = { name: report.name, stage, message: e instanceof Error ? e.message : String(e), at: Date.now() }
+      return false
+    }
+  }
+
+  function exportReport(name: string, includePlan: boolean): 'ok' | 'duplicate' | 'empty' | 'failed' {
+    if (!parsed.value) return 'failed'
+    const trimmed = name.trim()
+    if (!trimmed) return 'empty'
+    if (reports.value.some(r => r.name === trimmed)) return 'duplicate'
+    const p = parsed.value
+    const report: AnalysisReport = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+      name: trimmed,
+      createdAt: Date.now(),
+      sql: sql.value,
+      type: p.type,
+      complexity: p.complexity,
+      complexityLabel: complexityLabel.value.label,
+      tables: [...p.tables],
+      suggestions: [...p.suggestions],
+      includePlan,
+      plan: includePlan && plan.value ? (JSON.parse(JSON.stringify(plan.value)) as QueryPlan) : null,
+    }
+    return runExport(report) ? 'ok' : 'failed'
+  }
+
+  function retryExport(): 'ok' | 'duplicate' | 'failed' {
+    const journal = storageGet<ExportJournal>(EXPORT_JOURNAL_KEY)
+    if (!journal) return 'failed'
+    const existing = reports.value.find(r => r.name === journal.report.name)
+    if (existing) {
+      if (existing.id === journal.report.id) {
+        clearJournal() // 已写入成功，仅清理日志
+        exportFailure.value = null
+        return 'ok'
+      }
+      return 'duplicate'
+    }
+    return runExport(journal.report) ? 'ok' : 'failed'
+  }
+
+  function dismissExportFailure() {
+    clearJournal()
+    exportFailure.value = null
+  }
+
+  function deleteReport(id: string) {
+    reports.value = reports.value.filter(r => r.id !== id)
+    try { localStorage.setItem(REPORTS_KEY, JSON.stringify(reports.value)) } catch { /* noop */ }
+  }
+
+  return { sql, parsed, plan, activeSchema, complexityLabel, analyze, reports, exportFailure, exportReport, retryExport, dismissExportFailure, deleteReport }
 })
